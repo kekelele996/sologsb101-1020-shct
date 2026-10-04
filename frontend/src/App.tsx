@@ -7,17 +7,21 @@ import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { App as AntdApp, Badge, Button, Layout, Menu, Space, Tag, Typography } from 'antd';
 import {
   AppstoreOutlined,
+  AuditOutlined,
   BookOutlined,
   DiffOutlined,
   ExportOutlined,
   FileSearchOutlined,
   PrinterOutlined,
+  SafetyCertificateOutlined,
 } from '@ant-design/icons';
 import { ROUTES } from './router';
 import { loadAll, useAppDispatch, useAppSelector } from './stores/store';
 import { selectSteles } from './stores/steleSlice';
 import { selectRubbings } from './stores/rubbingSlice';
 import { selectLosses } from './stores/lossSlice';
+import { selectInspectionDamages, selectInspections } from './stores/inspectionSlice';
+import { useReconcile } from './hooks/useReconcile';
 import { initDatabase } from './utils/db';
 import { STELE_FORM_LABEL } from './types/stele';
 
@@ -32,6 +36,9 @@ export default function App() {
   const steles = useAppSelector(selectSteles);
   const rubbings = useAppSelector(selectRubbings);
   const losses = useAppSelector(selectLosses);
+  const inspections = useAppSelector(selectInspections);
+  const inspectionDamages = useAppSelector(selectInspectionDamages);
+  const reconcile = useReconcile();
   const currentSteleId = useAppSelector((state) => state.stele.currentSteleId);
 
   useEffect(() => {
@@ -56,11 +63,15 @@ export default function App() {
     ? ROUTES.rubbings
     : location.pathname.startsWith('/losses')
       ? ROUTES.losses
-      : location.pathname.startsWith('/compare')
-        ? ROUTES.compare
-        : location.pathname.startsWith('/export')
-          ? ROUTES.export
-          : ROUTES.steles;
+      : location.pathname.startsWith('/inspections')
+        ? ROUTES.inspections
+        : location.pathname.startsWith('/reconcile')
+          ? ROUTES.reconcile
+          : location.pathname.startsWith('/compare')
+            ? ROUTES.compare
+            : location.pathname.startsWith('/export')
+              ? ROUTES.export
+              : ROUTES.steles;
 
   return (
     <Layout style={{ minHeight: '100vh', background: 'transparent' }}>
@@ -83,6 +94,8 @@ export default function App() {
             { key: ROUTES.steles, icon: <AppstoreOutlined />, label: '碑刻台账' },
             { key: ROUTES.rubbings, icon: <PrinterOutlined />, label: '拓本登记' },
             { key: ROUTES.losses, icon: <BookOutlined />, label: '损泐字位' },
+            { key: ROUTES.inspections, icon: <AuditOutlined />, label: '原石巡查' },
+            { key: ROUTES.reconcile, icon: <SafetyCertificateOutlined />, label: '字位对账' },
             { key: ROUTES.compare, icon: <DiffOutlined />, label: '版本比对' },
             { key: ROUTES.export, icon: <ExportOutlined />, label: '编目卡导出' },
           ]}
@@ -94,6 +107,10 @@ export default function App() {
             </span>
             <span>拓本 {rubbings.length} 份</span>
             <span>损泐字位 {losses.length} 条</span>
+            <span>巡查单 {inspections.length} 张 · 原石残损 {inspectionDamages.length} 处</span>
+            <span style={{ color: reconcile.pendingTotal > 0 ? '#e8a08a' : undefined }}>
+              挂起待核字位 {reconcile.pendingTotal} 处
+            </span>
           </Space>
         </div>
       </Sider>

@@ -7,7 +7,11 @@ import { createId, db } from '@/utils/db';
 import type { Loss, LossDraft, LossSeverity, LossType } from '@/types/loss';
 import type { Compare, CompareDraft } from '@/types/compare';
 import { sortLosses } from '@/utils/collate';
+import { toPendingSave, type PendingSave } from '@/utils/saveRetry';
 import type { RootState } from './store';
+
+/** 编目侧（损泐 / 比对）失败动作种类；保存失败只在编目侧重试，巡查单不动 */
+export type LossRetryKind = 'loss/create' | 'loss/update';
 
 export interface LossFilters {
   keyword: string;
@@ -25,6 +29,8 @@ export interface LossState {
   /** 比对台选择的两个拓本 */
   compareAId: string | null;
   compareBId: string | null;
+  /** 编目侧保存失败重试队列（与巡查侧互不影响） */
+  pendingSaves: PendingSave<LossRetryKind, Record<string, unknown>>[];
 }
 
 const initialState: LossState = {
@@ -36,6 +42,7 @@ const initialState: LossState = {
   filters: { keyword: '', types: [], severities: [] },
   compareAId: null,
   compareBId: null,
+  pendingSaves: [],
 };
 
 export const loadLosses = createAsyncThunk('loss/load', async () => {
@@ -99,6 +106,22 @@ export const removeCompare = createAsyncThunk('compare/remove', async (id: strin
   await dispatch(loadLosses());
 });
 
+/** 编目侧重试：保存拓本损泐失败后只在本侧重放，巡查侧数据不动 */
+export const retryLossSave = createAsyncThunk(
+  'loss/retry',
+  async (fp: string, { dispatch, getState }) => {
+    const state = getState() as RootState;
+    const pending = state.loss.pendingSaves.find((item) => item.fp === fp);
+    if (!pending) return;
+    if (pending.kind === 'loss/create') await dispatch(createLoss(pending.payload as LossDraft)).unwrap();
+    else if (pending.kind === 'loss/update')
+      await dispatch(
+        updateLoss(pending.payload as { id: string; patch: Partial<Loss> }),
+      ).unwrap();
+    dispatch(dismissLossPending(fp));
+  },
+);
+
 const lossSlice = createSlice({
   name: 'loss',
   initialState,
@@ -121,6 +144,17 @@ const lossSlice = createSlice({
     setCompareB(state, action: PayloadAction<string | null>) {
       state.compareBId = action.payload;
     },
+    /** 移除一条编目侧失败记录（放弃重试） */
+    dismissLossPending(state, action: PayloadAction<string>) {
+      state.pendingSaves = state.pendingSaves.filter((item) => item.fp !== action.payload);
+    },
+    /** 编目侧保存失败入本侧队列 */
+    enqueueLossPending(
+      state,
+      action: PayloadAction<{ kind: LossRetryKind; payload: Record<string, unknown>; error: unknown }>,
+    ) {
+      state.pendingSaves.push(toPendingSave(action.payload.kind, action.payload.payload, action.payload.error));
+    },
   },
   extraReducers: (builder) => {
     builder
@@ -138,6 +172,10 @@ const lossSlice = createSlice({
         state.loading = false;
         state.ready = true;
         state.error = action.error.message ?? '损泐字位读取失败';
+      })
+      .addCase(retryLossSave.rejected, (state, action) => {
+        const target = state.pendingSaves.find((item) => item.fp === action.meta.arg);
+        if (target) target.error = action.error.message ?? '编目侧重试仍失败';
       });
   },
 });
@@ -149,6 +187,8 @@ export const {
   resetLossFilters,
   setCompareA,
   setCompareB,
+  dismissLossPending,
+  enqueueLossPending,
 } = lossSlice.actions;
 
 export const selectLossState = (state: RootState): LossState => state.loss;

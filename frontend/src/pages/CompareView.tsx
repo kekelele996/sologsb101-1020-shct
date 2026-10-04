@@ -27,13 +27,17 @@ import EmptyPanel from '@/components/common/EmptyPanel';
 import FilterBar, { useFilterQuery, type FilterSelectConfig } from '@/components/common/FilterBar';
 import LossTag from '@/components/common/LossTag';
 import StatBadge from '@/components/common/StatBadge';
+import RetryBanner from '@/components/common/RetryBanner';
 import { useLossDiff } from '@/hooks/useLossDiff';
+import { useReconcile } from '@/hooks/useReconcile';
 import { useAppDispatch, useAppSelector } from '@/stores/store';
 import { selectSteles, setCurrentStele } from '@/stores/steleSlice';
 import { selectRubbings } from '@/stores/rubbingSlice';
 import {
+  dismissLossPending,
   loadLosses,
   removeCompare,
+  retryLossSave,
   saveCompare,
   selectCompares,
   selectLosses,
@@ -73,6 +77,10 @@ export default function CompareView() {
   const [steleId, setSteleId] = useState<string>('');
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Compare | null>(null);
+  const [retryingFp, setRetryingFp] = useState<string | null>(null);
+
+  const pendingSaves = useAppSelector((state) => state.loss.pendingSaves);
+  const reconcile = useReconcile();
 
   useEffect(() => {
     if (steleId.length === 0) {
@@ -103,6 +111,15 @@ export default function CompareView() {
   const rubbingB = steleRubbings.find((item) => item.id === compareBId);
   const diff = useLossDiff(compareAId ?? undefined, compareBId ?? undefined);
   const stele = steles.find((item) => item.id === steleId);
+
+  // 断代闸门：任一方拓本有挂起（拓本标了损泐、巡查单没记且未核销）字位，未核实前不放行
+  const pendingRowsA = compareAId
+    ? reconcile.rowsOfRubbing(compareAId).filter((row) => row.status === 'pending')
+    : [];
+  const pendingRowsB = compareBId
+    ? reconcile.rowsOfRubbing(compareBId).filter((row) => row.status === 'pending')
+    : [];
+  const blocked = pendingRowsA.length + pendingRowsB.length > 0;
 
   const selects: FilterSelectConfig[] = [
     {
@@ -147,6 +164,10 @@ export default function CompareView() {
       message.warning('请选择两个不同的拓本进行比对');
       return;
     }
+    if (blocked) {
+      message.warning('存在挂起未核实的字位，该拓本断代比对暂不放行');
+      return;
+    }
     setEditing(null);
     form.setFieldsValue({
       ...createEmptyCompareDraft(steleId),
@@ -182,6 +203,18 @@ export default function CompareView() {
       message.success(`已保存比对记录：差异 ${values.diffCount} 字，结论「${COMPARE_CONCLUSION_LABEL[values.conclusion]}」`);
     }
     setOpen(false);
+  };
+
+  const handleLossRetry = async (fp: string): Promise<void> => {
+    setRetryingFp(fp);
+    try {
+      await dispatch(retryLossSave(fp)).unwrap();
+      message.success('编目侧重试成功（巡查单未改动）');
+    } catch {
+      message.error('重试仍失败，记录继续留在编目侧');
+    } finally {
+      setRetryingFp(null);
+    }
   };
 
   const columns: ColumnsType<Compare> = [
@@ -255,11 +288,53 @@ export default function CompareView() {
               dispatch(setCurrentStele(value));
             }}
           />
-          <Button type="primary" icon={<SaveOutlined />} onClick={openCreate}>
+          <Button type="primary" icon={<SaveOutlined />} onClick={openCreate} disabled={blocked} danger={blocked}>
             保存比对记录
           </Button>
         </Space>
       </div>
+
+      <RetryBanner
+        sideLabel="编目室"
+        pending={pendingSaves}
+        retryingFp={retryingFp}
+        onRetry={(fp) => void handleLossRetry(fp)}
+        onDismiss={(fp) => dispatch(dismissLossPending(fp))}
+      />
+
+      {blocked ? (
+        <Alert
+          style={{ marginBottom: 14 }}
+          type="error"
+          showIcon
+          message="断代比对暂不放行：存在挂起未核实的字位"
+          description={
+            <Space direction="vertical" size={4}>
+              {pendingRowsA.length > 0 ? (
+                <span>
+                  A（第 {rubbingA?.versionNo ?? '?'} 版）挂起 {pendingRowsA.length} 处：
+                  {pendingRowsA.map((row) => (
+                    <Tag key={row.loss.id} color="error">
+                      {encodeCoord(row.lineNo, row.charNo)}
+                    </Tag>
+                  ))}
+                </span>
+              ) : null}
+              {pendingRowsB.length > 0 ? (
+                <span>
+                  B（第 {rubbingB?.versionNo ?? '?'} 版）挂起 {pendingRowsB.length} 处：
+                  {pendingRowsB.map((row) => (
+                    <Tag key={row.loss.id} color="error">
+                      {encodeCoord(row.lineNo, row.charNo)}
+                    </Tag>
+                  ))}
+                </span>
+              ) : null}
+              <span>这些字位拓本标了损泐而巡查单未记，须等保管组现场看过（见损补记或无损核销）后才可保存断代结论；差异仍可预览。</span>
+            </Space>
+          }
+        />
+      ) : null}
 
       <div className="gb-stat-row">
         <StatBadge label="差异字数" value={diff.diffCount} suffix="字" tone="danger" />

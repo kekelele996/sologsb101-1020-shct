@@ -4,6 +4,7 @@
  * 消费 Loss、Rubbing；复用 <LossTag>、<FilterBar>、<StatBadge>、<EmptyPanel>。
  */
 import { useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   Alert,
   App as AntdApp,
@@ -28,16 +29,21 @@ import EmptyPanel from '@/components/common/EmptyPanel';
 import FilterBar, { useFilterQuery, type FilterSelectConfig } from '@/components/common/FilterBar';
 import LossTag from '@/components/common/LossTag';
 import StatBadge from '@/components/common/StatBadge';
+import RetryBanner from '@/components/common/RetryBanner';
 import { useLossDiff } from '@/hooks/useLossDiff';
+import { useReconcile } from '@/hooks/useReconcile';
 import { useAppDispatch, useAppSelector } from '@/stores/store';
 import { selectSteles, setCurrentStele } from '@/stores/steleSlice';
 import { selectRubbings } from '@/stores/rubbingSlice';
 import {
   batchUpdateLosses,
   createLoss,
+  dismissLossPending,
+  enqueueLossPending,
   loadLosses,
   removeLoss,
   resetLossFilters,
+  retryLossSave,
   selectLosses,
   setLossKeyword,
   setLossSeverities,
@@ -58,17 +64,22 @@ import {
   type LossType,
 } from '@/types/loss';
 import { encodeCoord, groupByLine, maxCharNo, sortLosses } from '@/utils/collate';
+import { RECONCILE_STATUS_COLOR, RECONCILE_STATUS_LABEL } from '@/types/reconciliation';
+import { ROUTES } from '@/router';
 
 const FILTER_KEYS = ['type', 'severity'] as const;
 
 export default function LossBoard() {
   const { message } = AntdApp.useApp();
   const dispatch = useAppDispatch();
+  const navigate = useNavigate();
   const [form] = Form.useForm<LossDraft>();
 
   const steles = useAppSelector(selectSteles);
   const rubbings = useAppSelector(selectRubbings);
   const losses = useAppSelector(selectLosses);
+  const pendingSaves = useAppSelector((state) => state.loss.pendingSaves);
+  const reconcile = useReconcile();
 
   const url = useFilterQuery(FILTER_KEYS);
   const [rubbingId, setRubbingId] = useState<string>('');
@@ -77,6 +88,7 @@ export default function LossBoard() {
   const [batchSeverity, setBatchSeverity] = useState<LossSeverity>('heavy');
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Loss | null>(null);
+  const [retryingFp, setRetryingFp] = useState<string | null>(null);
 
   useEffect(() => {
     dispatch(setLossKeyword(url.keyword));
@@ -132,6 +144,25 @@ export default function LossBoard() {
     };
   }, [losses, rubbingId]);
 
+  /** 拓本损泐 id → 对账状态（已对上 / 挂起 / 已核销） */
+  const statusOfLoss = useMemo(() => {
+    const map = new Map(reconcile.rowsOfRubbing(rubbingId).map((row) => [row.loss.id, row.status]));
+    return map;
+  }, [reconcile, rubbingId]);
+  const pendingCountOfCurrent = reconcile.rowsOfRubbing(rubbingId).filter((row) => row.status === 'pending').length;
+
+  const handleRetry = async (fp: string): Promise<void> => {
+    setRetryingFp(fp);
+    try {
+      await dispatch(retryLossSave(fp)).unwrap();
+      message.success('编目侧重试成功（巡查单未改动）');
+    } catch {
+      message.error('重试仍失败，记录继续留在编目侧');
+    } finally {
+      setRetryingFp(null);
+    }
+  };
+
   const gridLines = useMemo(() => {
     const list = losses.filter((loss) => loss.rubbingId === rubbingId);
     const grouped = groupByLine(list);
@@ -170,14 +201,27 @@ export default function LossBoard() {
 
   const submit = async (): Promise<void> => {
     const values = await form.validateFields();
-    if (editing) {
-      await dispatch(updateLoss({ id: editing.id, patch: values })).unwrap();
-      message.success(`已更新 ${encodeCoord(values.lineNo, values.charNo)} 字位`);
-    } else {
-      await dispatch(createLoss(values)).unwrap();
-      message.success(`已标注 ${encodeCoord(values.lineNo, values.charNo)} 字位`);
+    try {
+      if (editing) {
+        await dispatch(updateLoss({ id: editing.id, patch: values })).unwrap();
+        message.success(`已更新 ${encodeCoord(values.lineNo, values.charNo)} 字位`);
+      } else {
+        await dispatch(createLoss(values)).unwrap();
+        message.success(`已标注 ${encodeCoord(values.lineNo, values.charNo)} 字位`);
+      }
+      setOpen(false);
+    } catch (error) {
+      // 编目室保存失败：只在编目侧重试，巡查单不动
+      dispatch(
+        enqueueLossPending({
+          kind: editing ? 'loss/update' : 'loss/create',
+          payload: editing ? { id: editing.id, patch: values } : values,
+          error,
+        }),
+      );
+      message.error('字位保存失败，已留在编目侧稍后重试；巡查单未改动');
+      setOpen(false);
     }
-    setOpen(false);
   };
 
   const cellLoss = (lineNo: number, charNo: number): Loss | undefined =>
@@ -219,6 +263,24 @@ export default function LossBoard() {
             ? <Tag color="gold">存在差异</Tag>
             : <Tag>与基准一致</Tag>
           : <Typography.Text type="secondary">未选基准</Typography.Text>,
+    },
+    {
+      title: '原石对账',
+      key: 'reconcile',
+      width: 110,
+      render: (_value, record) => {
+        const status = statusOfLoss.get(record.id);
+        if (!status) return <Typography.Text type="secondary">—</Typography.Text>;
+        return (
+          <Tag
+            color={RECONCILE_STATUS_COLOR[status]}
+            style={{ cursor: status === 'pending' ? 'pointer' : 'default' }}
+            onClick={() => status === 'pending' && navigate(ROUTES.reconcile)}
+          >
+            {RECONCILE_STATUS_LABEL[status]}
+          </Tag>
+        );
+      },
     },
     {
       title: '操作',
@@ -276,6 +338,29 @@ export default function LossBoard() {
           </Button>
         </Space>
       </div>
+
+      <RetryBanner
+        sideLabel="编目室"
+        pending={pendingSaves}
+        retryingFp={retryingFp}
+        onRetry={(fp) => void handleRetry(fp)}
+        onDismiss={(fp) => dispatch(dismissLossPending(fp))}
+      />
+
+      {pendingCountOfCurrent > 0 ? (
+        <Alert
+          style={{ marginBottom: 14 }}
+          type="error"
+          showIcon
+          message={`该拓本有 ${pendingCountOfCurrent} 处损泐字位巡查单未记录，已挂起待现场核实`}
+          description="挂起未清前，该拓本的断代比对不放行；请到「字位对账」等保管组现场核实（见损补记 / 无损核销）。"
+          action={
+            <Button size="small" danger onClick={() => navigate(ROUTES.reconcile)}>
+              前往对账
+            </Button>
+          }
+        />
+      ) : null}
 
       <div className="gb-stat-row">
         <StatBadge label="字位总数" value={stat.total} suffix="条" tone="primary" />

@@ -23,6 +23,7 @@ import { DeleteOutlined, EditOutlined, PlusOutlined, TagsOutlined } from '@ant-d
 import EmptyPanel from '@/components/common/EmptyPanel';
 import FilterBar, { useFilterQuery, type FilterSelectConfig } from '@/components/common/FilterBar';
 import StatBadge from '@/components/common/StatBadge';
+import RetryBanner from '@/components/common/RetryBanner';
 import { useAppDispatch, useAppSelector } from '@/stores/store';
 import { selectSteles, setCurrentStele } from '@/stores/steleSlice';
 import {
@@ -31,10 +32,13 @@ import {
   batchUpdateSeals,
   createRubbing,
   createSeal,
+  dismissRubbingPending,
+  enqueueRubbingPending,
   loadRubbings,
   removeRubbing,
   removeSeal,
   resetRubbingFilters,
+  retryRubbingSave,
   selectFilteredRubbings,
   selectRubbings,
   selectSeals,
@@ -74,6 +78,7 @@ import {
 } from '@/types/seal';
 import { selectLosses } from '@/stores/lossSlice';
 import LossTag from '@/components/common/LossTag';
+import { useReconcile } from '@/hooks/useReconcile';
 
 const FILTER_KEYS = ['method', 'state'] as const;
 
@@ -88,6 +93,7 @@ export default function RubbingList() {
   const filtered = useAppSelector(selectFilteredRubbings);
   const seals = useAppSelector(selectSeals);
   const losses = useAppSelector(selectLosses);
+  const reconcile = useReconcile();
   const steleFilterId = useAppSelector((state) => state.rubbing.filters.steleId);
 
   const url = useFilterQuery(FILTER_KEYS);
@@ -101,6 +107,9 @@ export default function RubbingList() {
   const [editingSeal, setEditingSeal] = useState<Seal | null>(null);
   const [selectedSealIds, setSelectedSealIds] = useState<string[]>([]);
   const [batchSealType, setBatchSealType] = useState<SealType>('collection');
+  const [retryingFp, setRetryingFp] = useState<string | null>(null);
+
+  const pendingSaves = useAppSelector((state) => state.rubbing.pendingSaves);
 
   useEffect(() => {
     dispatch(setRubbingKeyword(url.keyword));
@@ -165,14 +174,27 @@ export default function RubbingList() {
 
   const submit = async (): Promise<void> => {
     const values = await form.validateFields();
-    if (editing) {
-      await dispatch(updateRubbing({ id: editing.id, patch: values })).unwrap();
-      message.success(`已更新第 ${values.versionNo} 版拓本`);
-    } else {
-      await dispatch(createRubbing(values)).unwrap();
-      message.success(`已登记第 ${values.versionNo} 版拓本`);
+    try {
+      if (editing) {
+        await dispatch(updateRubbing({ id: editing.id, patch: values })).unwrap();
+        message.success(`已更新第 ${values.versionNo} 版拓本`);
+      } else {
+        await dispatch(createRubbing(values)).unwrap();
+        message.success(`已登记第 ${values.versionNo} 版拓本`);
+      }
+      setOpen(false);
+    } catch (error) {
+      // 编目室保存拓本失败：只在编目侧重试，巡查单不动
+      dispatch(
+        enqueueRubbingPending({
+          kind: editing ? 'rubbing/update' : 'rubbing/create',
+          payload: editing ? { id: editing.id, patch: values } : values,
+          error,
+        }),
+      );
+      message.error('拓本保存失败，已留在编目侧稍后重试；巡查单未改动');
+      setOpen(false);
     }
-    setOpen(false);
   };
 
   const openSeals = (rubbing: Rubbing): void => {
@@ -186,15 +208,40 @@ export default function RubbingList() {
   const submitSeal = async (): Promise<void> => {
     if (!sealRubbing) return;
     const values = await sealForm.validateFields();
-    if (editingSeal) {
-      await dispatch(updateSeal({ id: editingSeal.id, patch: values })).unwrap();
-      message.success('已更新钤印');
-    } else {
-      await dispatch(createSeal({ ...values, rubbingId: sealRubbing.id })).unwrap();
-      message.success('已登记钤印');
+    try {
+      if (editingSeal) {
+        await dispatch(updateSeal({ id: editingSeal.id, patch: values })).unwrap();
+        message.success('已更新钤印');
+      } else {
+        await dispatch(createSeal({ ...values, rubbingId: sealRubbing.id })).unwrap();
+        message.success('已登记钤印');
+      }
+      setEditingSeal(null);
+      sealForm.setFieldsValue(createEmptySealDraft(sealRubbing.id));
+    } catch (error) {
+      dispatch(
+        enqueueRubbingPending({
+          kind: editingSeal ? 'seal/update' : 'seal/create',
+          payload: editingSeal ? { id: editingSeal.id, patch: values } : { ...values, rubbingId: sealRubbing.id },
+          error,
+        }),
+      );
+      message.error('钤印保存失败，已留在编目侧稍后重试；巡查单未改动');
+      setEditingSeal(null);
+      sealForm.setFieldsValue(createEmptySealDraft(sealRubbing.id));
     }
-    setEditingSeal(null);
-    sealForm.setFieldsValue(createEmptySealDraft(sealRubbing.id));
+  };
+
+  const handleRetry = async (fp: string): Promise<void> => {
+    setRetryingFp(fp);
+    try {
+      await dispatch(retryRubbingSave(fp)).unwrap();
+      message.success('编目侧重试成功（巡查单未改动）');
+    } catch {
+      message.error('重试仍失败，记录继续留在编目侧');
+    } finally {
+      setRetryingFp(null);
+    }
   };
 
   const columns: ColumnsType<Rubbing> = [
@@ -225,6 +272,7 @@ export default function RubbingList() {
         <Space direction="vertical" size={0}>
           <Typography.Text style={{ fontSize: 12 }}>
             损泐 {losses.filter((loss) => loss.rubbingId === record.id).length} 条
+            {reconcile.isBlocked(record.id) ? <Tag color="error" style={{ marginInlineStart: 6 }}>挂起·断代未放行</Tag> : null}
           </Typography.Text>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             钤印 {seals.filter((seal) => seal.rubbingId === record.id).length} 方
@@ -298,6 +346,14 @@ export default function RubbingList() {
           </Button>
         </Space>
       </div>
+
+      <RetryBanner
+        sideLabel="编目室"
+        pending={pendingSaves}
+        retryingFp={retryingFp}
+        onRetry={(fp) => void handleRetry(fp)}
+        onDismiss={(fp) => dispatch(dismissRubbingPending(fp))}
+      />
 
       <div className="gb-stat-row">
         <StatBadge label="拓本总数" value={stat.total} suffix="份" tone="primary" />

@@ -7,12 +7,16 @@ import type { Rubbing } from '@/types/rubbing';
 import type { Loss } from '@/types/loss';
 import type { Seal } from '@/types/seal';
 import type { Compare } from '@/types/compare';
+import type { Inspection, InspectionDamage } from '@/types/inspection';
+import type { Reconciliation } from '@/types/reconciliation';
 import { STELE_FORM_LABEL } from '@/types/stele';
 import { INK_TONE_LABEL, RUBBING_METHOD_LABEL, RUBBING_STATE_LABEL } from '@/types/rubbing';
 import { LOSS_SEVERITY_LABEL, LOSS_TYPE_LABEL } from '@/types/loss';
 import { SEAL_TYPE_LABEL, sealPositionWeight } from '@/types/seal';
 import { COMPARE_CONCLUSION_LABEL } from '@/types/compare';
+import { RECONCILE_STATUS_LABEL } from '@/types/reconciliation';
 import { diffLosses, encodeCoord, sortLosses } from './collate';
+import { reconcileAll } from './reconcile';
 import type { RubbingSnapshot } from './db';
 
 export function download(filename: string, content: string, mime: string): void {
@@ -44,36 +48,54 @@ function csvCell(value: string | number | null): string {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
-/** 编目卡：一块碑刻 + 其拓本 + 损泐 + 钤印 + 比对结论 */
+/** 编目卡：一块碑刻 + 其拓本 + 损泐（含巡查对账状态）+ 钤印 + 比对结论 + 巡查单 */
 export function buildCatalogCard(
   stele: Stele,
   rubbings: Rubbing[],
   losses: Loss[],
   seals: Seal[],
   compares: Compare[],
+  inspections: Inspection[] = [],
+  inspectionDamages: InspectionDamage[] = [],
+  reconciliations: Reconciliation[] = [],
 ): string {
   const lines: string[] = [];
+  const reconcileRows = reconcileAll(losses, rubbings, inspectionDamages, reconciliations);
   lines.push(`【碑帖编目卡】${stele.title}`);
   lines.push(`年代：${stele.era || '待考'}　形制：${STELE_FORM_LABEL[stele.form]}　尺寸：${stele.sizeCm || '未测'}`);
   lines.push(`所在地：${stele.location || '未记'}　书者：${stele.calligrapher || '佚名'}`);
-  lines.push(`拓本数：${rubbings.length}　损泐字位：${losses.length} 条　钤印：${seals.length} 方`);
+  const pendingAll = reconcileRows.filter((row) => row.steleId === stele.id && row.status === 'pending').length;
+  lines.push(
+    `拓本数：${rubbings.length}　损泐字位：${losses.length} 条　钤印：${seals.length} 方　原石巡查单：${inspections.length} 张　挂起待核：${pendingAll} 处`,
+  );
   lines.push('');
 
   [...rubbings]
     .sort((a, b) => a.versionNo - b.versionNo)
     .forEach((rubbing) => {
       const rubbingLosses = sortLosses(losses.filter((loss) => loss.rubbingId === rubbing.id));
+      const statusByLoss = new Map(
+        reconcileRows.filter((row) => row.rubbingId === rubbing.id).map((row) => [row.loss.id, row.status]),
+      );
+      const pending = reconcileRows.filter(
+        (row) => row.rubbingId === rubbing.id && row.status === 'pending',
+      ).length;
       const rubbingSeals = seals
         .filter((seal) => seal.rubbingId === rubbing.id)
         .sort((a, b) => sealPositionWeight(a.position) - sealPositionWeight(b.position));
       lines.push(
-        `第 ${rubbing.versionNo} 版　${RUBBING_METHOD_LABEL[rubbing.method]}　${INK_TONE_LABEL[rubbing.inkTone]}　${rubbing.paperType}　${rubbing.sizeCm || '尺寸未记'}　收藏号 ${rubbing.collectionNo || '未编'}　${rubbing.dateGuess || '年代待考'}　${RUBBING_STATE_LABEL[rubbing.state]}`,
+        `第 ${rubbing.versionNo} 版　${RUBBING_METHOD_LABEL[rubbing.method]}　${INK_TONE_LABEL[rubbing.inkTone]}　${rubbing.paperType}　${rubbing.sizeCm || '尺寸未记'}　收藏号 ${rubbing.collectionNo || '未编'}　${rubbing.dateGuess || '年代待考'}　${RUBBING_STATE_LABEL[rubbing.state]}${
+          pending > 0 ? `　【挂起 ${pending} 处·断代未放行】` : ''
+        }`,
       );
       lines.push(`　损泐字位（${rubbingLosses.length} 条）：`);
       if (rubbingLosses.length === 0) lines.push('　　无');
       rubbingLosses.forEach((loss) => {
+        const status = statusByLoss.get(loss.id);
         lines.push(
-          `　　${encodeCoord(loss.lineNo, loss.charNo)}　${LOSS_TYPE_LABEL[loss.type]}·${LOSS_SEVERITY_LABEL[loss.severity]}　${loss.note || ''}`,
+          `　　${encodeCoord(loss.lineNo, loss.charNo)}　${LOSS_TYPE_LABEL[loss.type]}·${LOSS_SEVERITY_LABEL[loss.severity]}　${loss.note || ''}　［原石对账：${
+            status ? RECONCILE_STATUS_LABEL[status] : '—'
+          }］`,
         );
       });
       lines.push(`　钤印（${rubbingSeals.length} 方）：`);
@@ -83,6 +105,30 @@ export function buildCatalogCard(
       });
       lines.push('');
     });
+
+  const steleInspections = inspections
+    .filter((sheet) => sheet.steleId === stele.id)
+    .sort((a, b) => b.inspectedAt.localeCompare(a.inspectedAt));
+  lines.push(`原石巡查单（${steleInspections.length} 张，只照原石现状记录）：`);
+  if (steleInspections.length === 0) lines.push('　无');
+  steleInspections.forEach((sheet) => {
+    lines.push(
+      `　${sheet.sheetNo}　${sheet.inspectedAt}　巡查人 ${sheet.inspector || '未填'}${sheet.readonly ? '　【只读老单·残损拆不到字位】' : ''}`,
+    );
+    lines.push(`　　碑面现状：${sheet.surfaceStatus || '未记'}`);
+    lines.push(`　　防护处置：${sheet.protection || '未记'}`);
+    if (sheet.legacyDamageText) lines.push(`　　老单原始描述：${sheet.legacyDamageText}`);
+    inspectionDamages
+      .filter((damage) => damage.inspectionId === sheet.id)
+      .sort((a, b) => (a.lineNo === b.lineNo ? a.charNo - b.charNo : a.lineNo - b.lineNo))
+      .forEach((damage) => {
+        lines.push(
+          `　　原石残损 ${encodeCoord(damage.lineNo, damage.charNo)}　${LOSS_TYPE_LABEL[damage.type]}·${
+            LOSS_SEVERITY_LABEL[damage.severity]
+          }　${damage.note || ''}`,
+        );
+      });
+  });
 
   const steleCompares = compares.filter((compare) => compare.steleId === stele.id);
   lines.push(`版本比对记录（${steleCompares.length} 条）：`);
@@ -106,9 +152,16 @@ export function exportCatalogCard(
   losses: Loss[],
   seals: Seal[],
   compares: Compare[],
+  inspections: Inspection[] = [],
+  inspectionDamages: InspectionDamage[] = [],
+  reconciliations: Reconciliation[] = [],
 ): string {
   const filename = `${stele.title}-编目卡-${stampSuffix()}.txt`;
-  download(filename, buildCatalogCard(stele, rubbings, losses, seals, compares), 'text/plain;charset=utf-8');
+  download(
+    filename,
+    buildCatalogCard(stele, rubbings, losses, seals, compares, inspections, inspectionDamages, reconciliations),
+    'text/plain;charset=utf-8',
+  );
   return filename;
 }
 
@@ -118,6 +171,9 @@ export interface ExportContext {
   losses: Loss[];
   seals: Seal[];
   compares: Compare[];
+  inspections: Inspection[];
+  inspectionDamages: InspectionDamage[];
+  reconciliations: Reconciliation[];
 }
 
 /** 全部碑刻的编目卡合订文本 */
@@ -131,21 +187,32 @@ export function buildAllCatalogCards(context: ExportContext): string {
         context.losses,
         context.seals,
         context.compares,
+        context.inspections,
+        context.inspectionDamages,
+        context.reconciliations,
       ),
     )
     .join('\n\n————————————————\n\n');
 }
 
-/** 损泐台账 CSV（碑刻 / 拓本 / 字位 / 类型 / 程度） */
+/** 损泐台账 CSV（碑刻 / 拓本 / 字位 / 类型 / 程度 / 原石对账状态） */
 export function exportLossLedgerCsv(context: ExportContext): string {
-  const header = ['碑名', '拓本版本', '拓法', '行号', '字位', '坐标', '损泐类型', '严重程度', '释文备注'];
+  const header = ['碑名', '拓本版本', '拓法', '行号', '字位', '坐标', '损泐类型', '严重程度', '原石对账', '释文备注'];
   const lines: string[] = [header.map(csvCell).join(',')];
+  const reconcileRows = reconcileAll(
+    context.losses,
+    context.rubbings,
+    context.inspectionDamages,
+    context.reconciliations,
+  );
+  const statusByLoss = new Map(reconcileRows.map((row) => [row.loss.id, row.status] as const));
   context.steles.forEach((stele) => {
     const rubbings = context.rubbings
       .filter((rubbing) => rubbing.steleId === stele.id)
       .sort((a, b) => a.versionNo - b.versionNo);
     rubbings.forEach((rubbing) => {
       sortLosses(context.losses.filter((loss) => loss.rubbingId === rubbing.id)).forEach((loss) => {
+        const status = statusByLoss.get(loss.id);
         lines.push(
           [
             stele.title,
@@ -156,6 +223,7 @@ export function exportLossLedgerCsv(context: ExportContext): string {
             encodeCoord(loss.lineNo, loss.charNo),
             LOSS_TYPE_LABEL[loss.type],
             LOSS_SEVERITY_LABEL[loss.severity],
+            status ? RECONCILE_STATUS_LABEL[status] : '—',
             loss.note,
           ]
             .map(csvCell)

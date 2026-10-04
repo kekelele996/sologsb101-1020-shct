@@ -1,8 +1,11 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据结构版本号与升级迁移逻辑（v1 → v2：Loss 增加 charNo 与复合索引，并按行号顺序重建历史字位记录）
- * - 五张业务表的增删改查与整库导入导出
- * - 首次打开自动播种三层互相引用的演示数据（幂等）
+ * - 数据结构版本号与升级迁移逻辑
+ *   v1 → v2：Loss 增加 charNo 与复合索引，并按行号顺序重建历史字位记录
+ *   v2 → v3：接入原石巡查 —— 新增 inspections / inspectionDamages / reconciliations
+ *            旧巡查单未拆字位的残损描述按「第 N 行第 M 字」补拆，拆不出的老单置只读
+ * - 八张业务表的增删改查与整库导入导出
+ * - 首次打开自动播种四层互相引用的演示数据（幂等）
  * 纯前端应用：不依赖任何后端服务或数据库。
  */
 import Dexie, { type Table } from 'dexie';
@@ -11,13 +14,16 @@ import type { Rubbing } from '@/types/rubbing';
 import type { Loss } from '@/types/loss';
 import type { Seal } from '@/types/seal';
 import type { Compare } from '@/types/compare';
+import type { Inspection, InspectionDamage } from '@/types/inspection';
+import type { Reconciliation } from '@/types/reconciliation';
 import { sortLosses } from './collate';
+import { splitLegacyDamageText } from './reconcile';
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbrubbing';
 
-/** 当前数据结构版本号 */
-export const DB_SCHEMA_VERSION = 2;
+/** 当前数据结构版本号（v3：接入原石巡查与字位对账） */
+export const DB_SCHEMA_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -85,6 +91,9 @@ class RubbingDatabase extends Dexie {
   losses!: Table<Loss, string>;
   seals!: Table<Seal, string>;
   compares!: Table<Compare, string>;
+  inspections!: Table<Inspection, string>;
+  inspectionDamages!: Table<InspectionDamage, string>;
+  reconciliations!: Table<Reconciliation, string>;
 
   constructor() {
     super(DB_NAME);
@@ -99,6 +108,15 @@ class RubbingDatabase extends Dexie {
     });
 
     // v2：Loss 增加 charNo 与 [rubbingId+lineNo+charNo] 复合索引，并按行号顺序重建历史字位记录
+    this.version(2).stores({
+      steles: 'id, title, era, form, location, updatedAt',
+      rubbings: 'id, steleId, versionNo, method, inkTone, state, updatedAt',
+      losses: 'id, rubbingId, lineNo, charNo, [rubbingId+lineNo+charNo], type, severity, updatedAt',
+      seals: 'id, rubbingId, sealType, position, updatedAt',
+      compares: 'id, steleId, rubbingIdA, rubbingIdB, conclusion, date, updatedAt',
+    });
+
+    // v3：接入原石巡查 —— 巡查单 / 原石残损字位 / 对账核销
     this.version(DB_SCHEMA_VERSION)
       .stores({
         steles: 'id, title, era, form, location, updatedAt',
@@ -106,15 +124,20 @@ class RubbingDatabase extends Dexie {
         losses: 'id, rubbingId, lineNo, charNo, [rubbingId+lineNo+charNo], type, severity, updatedAt',
         seals: 'id, rubbingId, sealType, position, updatedAt',
         compares: 'id, steleId, rubbingIdA, rubbingIdB, conclusion, date, updatedAt',
+        inspections: 'id, steleId, sheetNo, inspectedAt, readonly, updatedAt',
+        inspectionDamages:
+          'id, inspectionId, steleId, lineNo, charNo, [steleId+lineNo+charNo], type, severity, updatedAt',
+        reconciliations: 'id, steleId, rubbingId, lossId, lineNo, charNo, verifiedAt, updatedAt',
       })
       .upgrade(async (tx) => {
-        const table = tx.table<Loss>('losses');
-        const all = await table.toArray();
+        // v2 字位补拆迁移（保留原逻辑）
+        const lossTable = tx.table<Loss>('losses');
+        const allLosses = await lossTable.toArray();
         const byRubbing = new Map<string, Loss[]>();
-        all.forEach((loss) => {
+        allLosses.forEach((loss) => {
           byRubbing.set(loss.rubbingId, [...(byRubbing.get(loss.rubbingId) ?? []), loss]);
         });
-        const rebuilt: Loss[] = [];
+        const rebuiltLosses: Loss[] = [];
         byRubbing.forEach((list) => {
           // 按行号排序后，为缺失 charNo 的历史记录在行内顺序补位
           const sorted = [...list].sort((a, b) => a.lineNo - b.lineNo);
@@ -123,10 +146,30 @@ class RubbingDatabase extends Dexie {
             const used = counter.get(loss.lineNo) ?? 0;
             const charNo = typeof loss.charNo === 'number' && loss.charNo > 0 ? loss.charNo : used + 1;
             counter.set(loss.lineNo, Math.max(used, charNo));
-            rebuilt.push({ ...loss, charNo, updatedAt: Date.now() });
+            rebuiltLosses.push({ ...loss, charNo, updatedAt: Date.now() });
           });
         });
-        await table.bulkPut(sortLosses(rebuilt));
+        await lossTable.bulkPut(sortLosses(rebuiltLosses));
+
+        // 巡查侧是新表：仅在为空（从 v1/v2 升级）时补入演示巡查单，
+        // 并把旧巡查单整段残损描述按碑面行号补拆为字位残损；拆不出字位的老单留只读。
+        const inspectionTable = tx.table<Inspection>('inspections');
+        if ((await inspectionTable.count()) === 0) {
+          const steleIds = new Set((await tx.table<Stele>('steles').toArray()).map((row) => row.id));
+          const rubbingIds = new Set((await tx.table<Rubbing>('rubbings').toArray()).map((row) => row.id));
+          const lossIds = new Set((await tx.table<Loss>('losses').toArray()).map((row) => row.id));
+          const seed = buildInspectionSeed(Date.now());
+          const inspections = seed.inspections.filter((row) => steleIds.has(row.steleId));
+          const damages = seed.damages.filter((row) => steleIds.has(row.steleId));
+          const reconciliations = seed.reconciliations.filter(
+            (row) => steleIds.has(row.steleId) && rubbingIds.has(row.rubbingId) && lossIds.has(row.lossId),
+          );
+          if (inspections.length > 0) {
+            await inspectionTable.bulkPut(inspections);
+            await tx.table<InspectionDamage>('inspectionDamages').bulkPut(damages);
+            await tx.table<Reconciliation>('reconciliations').bulkPut(reconciliations);
+          }
+        }
       });
   }
 }
@@ -149,7 +192,7 @@ export async function initDatabase(): Promise<void> {
 }
 
 /* ------------------------------ 播种数据 ------------------------------ */
-/* 三层互相引用：Stele → Rubbing →（Loss / Seal）＋ Stele → Compare */
+/* 四层互相引用：Stele → Rubbing →（Loss / Seal）＋ Stele → Inspection → InspectionDamage，另含对账核销 */
 
 export async function seedDatabase(): Promise<void> {
   const now = Date.now();
@@ -187,7 +230,7 @@ export async function seedDatabase(): Promise<void> {
       sizeCm: '268×92',
       calligrapher: '颜真卿（楷书）',
       createdAt: now - day * 36,
-      updatedAt: now - day,
+      updatedAt: now - day * 1,
     },
   ];
 
@@ -224,13 +267,157 @@ export async function seedDatabase(): Promise<void> {
     { id: 'cmp_0201', steleId: 'stele_02', rubbingIdA: 'rub_0201', rubbingIdB: 'rub_0202', diffCount: 1, conclusion: 'late', operator: '傅砚', date: '2026-03-08', createdAt: now - day * 3, updatedAt: now - day * 3 },
   ];
 
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
-    await db.steles.bulkPut(steles);
-    await db.rubbings.bulkPut(rubbings);
-    await db.losses.bulkPut(losses);
-    await db.seals.bulkPut(seals);
-    await db.compares.bulkPut(compares);
-  });
+  const inspectionSeed = buildInspectionSeed(now);
+
+  await db.transaction(
+    'rw',
+    [db.steles, db.rubbings, db.losses, db.seals, db.compares, db.inspections, db.inspectionDamages, db.reconciliations],
+    async () => {
+      await db.steles.bulkPut(steles);
+      await db.rubbings.bulkPut(rubbings);
+      await db.losses.bulkPut(losses);
+      await db.seals.bulkPut(seals);
+      await db.compares.bulkPut(compares);
+      await db.inspections.bulkPut(inspectionSeed.inspections);
+      await db.inspectionDamages.bulkPut(inspectionSeed.damages);
+      await db.reconciliations.bulkPut(inspectionSeed.reconciliations);
+    },
+  );
+}
+
+/* --------------------- 巡查侧演示数据（含老单补拆） --------------------- */
+
+interface InspectionSeed {
+  inspections: Inspection[];
+  damages: InspectionDamage[];
+  reconciliations: Reconciliation[];
+}
+
+/**
+ * 巡查侧演示数据：
+ * - 正常巡查单（照原石现状记录）：insp_0101 / insp_0201
+ * - 旧系统迁移老单：insp_0301（残损描述可按行号补拆）、insp_0302（拆不出字位 → 只读）
+ * 补拆结果由 materializeLegacyInspections 统一生成，保证「升级补拆」与「新库播种」口径一致。
+ */
+export function buildInspectionSeed(now: number): InspectionSeed {
+  const day = 86400000;
+
+  const inspections: Inspection[] = [
+    {
+      id: 'insp_0101',
+      steleId: 'stele_01',
+      sheetNo: 'XC-0101',
+      inspectedAt: '2026-02-18',
+      inspector: '卫山',
+      surfaceStatus: '碑面整体完好，第三行右下、第九行有旧损；碑阳中部有近期拓制留痕。',
+      protection: '碑亭遮檐完好，加装防风化围挡，禁止近拓。',
+      legacyDamageText: '',
+      readonly: false,
+      createdAt: now - day * 16,
+      updatedAt: now - day * 16,
+    },
+    {
+      id: 'insp_0201',
+      steleId: 'stele_02',
+      sheetNo: 'XC-0201',
+      inspectedAt: '2026-02-20',
+      inspector: '卫山',
+      surfaceStatus: '摩崖崖面第二行有细裂一道，裂隙无扩展；其余字口清晰。',
+      protection: '裂隙支顶监测，季度复测。',
+      legacyDamageText: '',
+      readonly: false,
+      createdAt: now - day * 14,
+      updatedAt: now - day * 14,
+    },
+    {
+      id: 'insp_0301',
+      steleId: 'stele_03',
+      sheetNo: 'XC-0301（旧）',
+      inspectedAt: '2025-11-02',
+      inspector: '邵巡',
+      surfaceStatus: '旧系统抄录，残损未按字位登记。',
+      protection: '旧单未记防护处置。',
+      // 可按行号补拆的老单原文
+      legacyDamageText: '第三行第七字有细裂纹一道；第四行第三字漫漶，字口已平；第五行第二字石花一处。',
+      readonly: false,
+      createdAt: now - day * 120,
+      updatedAt: now - day * 120,
+    },
+    {
+      id: 'insp_0302',
+      steleId: 'stele_03',
+      sheetNo: 'XC-0302（旧）',
+      inspectedAt: '2025-08-15',
+      inspector: '邵巡',
+      surfaceStatus: '旧系统抄录，残损未按字位登记。',
+      protection: '旧单未记防护处置。',
+      // 无法定位到字位的老单原文 → 补拆失败 → 只读
+      legacyDamageText: '碑额左下角风化较重，石筋处有数道裂纹，具体字位待现场核。',
+      readonly: false,
+      createdAt: now - day * 200,
+      updatedAt: now - day * 200,
+    },
+  ];
+
+  const damages: InspectionDamage[] = [
+    { id: 'idmg_010101', inspectionId: 'insp_0101', steleId: 'stele_01', lineNo: 3, charNo: 7, type: 'blur', severity: 'medium', note: '原石「壽」字右下确有漫漶', createdAt: now - day * 16, updatedAt: now - day * 16 },
+    { id: 'idmg_010102', inspectionId: 'insp_0101', steleId: 'stele_01', lineNo: 9, charNo: 11, type: 'missing', severity: 'heavy', note: '原石「禮」字末笔确缺', createdAt: now - day * 16, updatedAt: now - day * 16 },
+    { id: 'idmg_020101', inspectionId: 'insp_0201', steleId: 'stele_02', lineNo: 2, charNo: 5, type: 'crack', severity: 'light', note: '崖面细裂，与拓本所现一致', createdAt: now - day * 14, updatedAt: now - day * 14 },
+  ];
+
+  // 旧单按碑面行号补拆；拆不出来的老单置只读
+  materializeLegacyInspections(inspections, damages);
+
+  const reconciliations: Reconciliation[] = [
+    {
+      id: 'rec_010102',
+      lossId: 'loss_010102',
+      rubbingId: 'rub_0101',
+      steleId: 'stele_01',
+      lineNo: 5,
+      charNo: 2,
+      reason: '原石该字位完好，所谓石花为拓本纸疤，非石面残损。',
+      verifier: '卫山',
+      verifiedAt: '2026-02-18',
+      createdAt: now - day * 16,
+      updatedAt: now - day * 16,
+    },
+  ];
+
+  return { inspections, damages, reconciliations };
+}
+
+/**
+ * 对 legacyDamageText 非空的老巡查单按行号补拆：
+ * - 每个实义分句都带「第 N 行第 M 字」→ 拆成原石残损字位，单子可继续使用
+ * - 任一分句定不到字位 → 不拆，单子 readonly 留只读
+ */
+export function materializeLegacyInspections(inspections: Inspection[], damages: InspectionDamage[]): void {
+  inspections
+    .filter((sheet) => sheet.legacyDamageText.trim().length > 0)
+    .forEach((sheet) => {
+      const result = splitLegacyDamageText(sheet.legacyDamageText);
+      if (!result.complete) {
+        sheet.readonly = true;
+        return;
+      }
+      sheet.readonly = false;
+      const stamp = Date.now();
+      result.items.forEach((item, index) => {
+        damages.push({
+          id: `idmg_${sheet.id.replace('insp_', '')}${String(index + 1).padStart(2, '0')}`,
+          inspectionId: sheet.id,
+          steleId: sheet.steleId,
+          lineNo: item.lineNo,
+          charNo: item.charNo,
+          type: item.type,
+          severity: item.severity,
+          note: `【老单补拆】${item.note}`,
+          createdAt: stamp,
+          updatedAt: stamp,
+        });
+      });
+    });
 }
 
 /* ------------------------------ 整库导入导出 ------------------------------ */
@@ -244,15 +431,21 @@ export interface RubbingSnapshot {
   losses: Loss[];
   seals: Seal[];
   compares: Compare[];
+  inspections: Inspection[];
+  inspectionDamages: InspectionDamage[];
+  reconciliations: Reconciliation[];
 }
 
 export async function exportSnapshot(): Promise<RubbingSnapshot> {
-  const [steles, rubbings, losses, seals, compares] = await Promise.all([
+  const [steles, rubbings, losses, seals, compares, inspections, inspectionDamages, reconciliations] = await Promise.all([
     db.steles.toArray(),
     db.rubbings.toArray(),
     db.losses.toArray(),
     db.seals.toArray(),
     db.compares.toArray(),
+    db.inspections.toArray(),
+    db.inspectionDamages.toArray(),
+    db.reconciliations.toArray(),
   ]);
   return {
     app: DB_NAME,
@@ -263,10 +456,13 @@ export async function exportSnapshot(): Promise<RubbingSnapshot> {
     losses,
     seals,
     compares,
+    inspections,
+    inspectionDamages,
+    reconciliations,
   };
 }
 
-/** 校验导入文件结构，返回错误文案（空串表示通过） */
+/** 校验导入文件结构，返回错误文案（空串表示通过）；兼容 v2 旧备份（无巡查三表） */
 export function validateSnapshot(input: unknown): string {
   if (typeof input !== 'object' || input === null) return '文件内容不是合法的 JSON 对象';
   const snapshot = input as Partial<RubbingSnapshot>;
@@ -278,27 +474,53 @@ export function validateSnapshot(input: unknown): string {
   return '';
 }
 
+const ALL_TABLES = [
+  'steles',
+  'rubbings',
+  'losses',
+  'seals',
+  'compares',
+  'inspections',
+  'inspectionDamages',
+  'reconciliations',
+] as const;
+
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
-    await Promise.all([
-      db.steles.clear(),
-      db.rubbings.clear(),
-      db.losses.clear(),
-      db.seals.clear(),
-      db.compares.clear(),
-    ]);
-  });
+  await db.transaction(
+    'rw',
+    [db.steles, db.rubbings, db.losses, db.seals, db.compares, db.inspections, db.inspectionDamages, db.reconciliations],
+    async () => {
+      await Promise.all([
+        db.steles.clear(),
+        db.rubbings.clear(),
+        db.losses.clear(),
+        db.seals.clear(),
+        db.compares.clear(),
+        db.inspections.clear(),
+        db.inspectionDamages.clear(),
+        db.reconciliations.clear(),
+      ]);
+    },
+  );
 }
 
 export async function importSnapshot(snapshot: RubbingSnapshot): Promise<void> {
   await clearAllTables();
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
-    await db.steles.bulkPut(snapshot.steles);
-    await db.rubbings.bulkPut(snapshot.rubbings);
-    await db.losses.bulkPut(snapshot.losses);
-    await db.seals.bulkPut(snapshot.seals);
-    await db.compares.bulkPut(snapshot.compares);
-  });
+  await db.transaction(
+    'rw',
+    [db.steles, db.rubbings, db.losses, db.seals, db.compares, db.inspections, db.inspectionDamages, db.reconciliations],
+    async () => {
+      await db.steles.bulkPut(snapshot.steles);
+      await db.rubbings.bulkPut(snapshot.rubbings);
+      await db.losses.bulkPut(snapshot.losses);
+      await db.seals.bulkPut(snapshot.seals);
+      await db.compares.bulkPut(snapshot.compares);
+      // v2 旧备份没有巡查三表，按空集合导入
+      await db.inspections.bulkPut(snapshot.inspections ?? []);
+      await db.inspectionDamages.bulkPut(snapshot.inspectionDamages ?? []);
+      await db.reconciliations.bulkPut(snapshot.reconciliations ?? []);
+    },
+  );
 }
 
 export async function resetDatabase(): Promise<void> {
@@ -307,40 +529,59 @@ export async function resetDatabase(): Promise<void> {
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [steles, rubbings, losses, seals, compares] = await Promise.all([
+  const [steles, rubbings, losses, seals, compares, inspections, inspectionDamages, reconciliations] = await Promise.all([
     db.steles.count(),
     db.rubbings.count(),
     db.losses.count(),
     db.seals.count(),
     db.compares.count(),
+    db.inspections.count(),
+    db.inspectionDamages.count(),
+    db.reconciliations.count(),
   ]);
-  return { steles, rubbings, losses, seals, compares };
+  return { steles, rubbings, losses, seals, compares, inspections, inspectionDamages, reconciliations };
 }
 
-/** 级联删除碑刻 → 拓本 → 损泐 / 钤印 / 比对 */
+/** 级联删除碑刻 → 拓本 → 损泐 / 钤印 / 比对；巡查侧三表同碑记录一并删除（保管组按碑独立留痕） */
 export async function removeSteleCascade(steleId: string): Promise<void> {
   const rubbingIds = (await db.rubbings.where('steleId').equals(steleId).toArray()).map((row) => row.id);
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
-    if (rubbingIds.length > 0) {
-      await db.losses.where('rubbingId').anyOf(rubbingIds).delete();
-      await db.seals.where('rubbingId').anyOf(rubbingIds).delete();
-    }
-    await db.rubbings.where('steleId').equals(steleId).delete();
-    await db.compares.where('steleId').equals(steleId).delete();
-    await db.steles.delete(steleId);
-  });
+  const inspectionIds = (await db.inspections.where('steleId').equals(steleId).toArray()).map((row) => row.id);
+  await db.transaction(
+    'rw',
+    [db.steles, db.rubbings, db.losses, db.seals, db.compares, db.inspections, db.inspectionDamages, db.reconciliations],
+    async () => {
+      if (rubbingIds.length > 0) {
+        await db.losses.where('rubbingId').anyOf(rubbingIds).delete();
+        await db.seals.where('rubbingId').anyOf(rubbingIds).delete();
+      }
+      if (inspectionIds.length > 0) {
+        await db.inspectionDamages.where('inspectionId').anyOf(inspectionIds).delete();
+      }
+      await db.reconciliations.where('steleId').equals(steleId).delete();
+      await db.inspectionDamages.where('steleId').equals(steleId).delete();
+      await db.inspections.where('steleId').equals(steleId).delete();
+      await db.rubbings.where('steleId').equals(steleId).delete();
+      await db.compares.where('steleId').equals(steleId).delete();
+      await db.steles.delete(steleId);
+    },
+  );
 }
 
-/** 级联删除拓本 → 损泐 / 钤印 / 涉及的比对记录 */
+/** 级联删除拓本 → 损泐 / 钤印 / 涉及的比对记录；该拓本的对账核销随之删除（巡查单不动） */
 export async function removeRubbingCascade(rubbingId: string): Promise<void> {
-  await db.transaction('rw', [db.rubbings, db.losses, db.seals, db.compares], async () => {
-    await db.losses.where('rubbingId').equals(rubbingId).delete();
-    await db.seals.where('rubbingId').equals(rubbingId).delete();
-    const compares = await db.compares.toArray();
-    const affected = compares.filter((row) => row.rubbingIdA === rubbingId || row.rubbingIdB === rubbingId);
-    if (affected.length > 0) await db.compares.bulkDelete(affected.map((row) => row.id));
-    await db.rubbings.delete(rubbingId);
-  });
+  await db.transaction(
+    'rw',
+    [db.rubbings, db.losses, db.seals, db.compares, db.reconciliations],
+    async () => {
+      await db.losses.where('rubbingId').equals(rubbingId).delete();
+      await db.seals.where('rubbingId').equals(rubbingId).delete();
+      await db.reconciliations.where('rubbingId').equals(rubbingId).delete();
+      const compares = await db.compares.toArray();
+      const affected = compares.filter((row) => row.rubbingIdA === rubbingId || row.rubbingIdB === rubbingId);
+      if (affected.length > 0) await db.compares.bulkDelete(affected.map((row) => row.id));
+      await db.rubbings.delete(rubbingId);
+    },
+  );
 }
 
 /** 重排某碑刻下拓本的版本序号，保证连续 */
@@ -349,3 +590,5 @@ export async function renumberRubbings(steleId: string): Promise<void> {
   const sorted = [...rows].sort((a, b) => (a.versionNo === b.versionNo ? a.createdAt - b.createdAt : a.versionNo - b.versionNo));
   await db.rubbings.bulkPut(sorted.map((row, index) => ({ ...row, versionNo: index + 1, updatedAt: Date.now() })));
 }
+
+export { ALL_TABLES };

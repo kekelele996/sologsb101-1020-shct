@@ -12,7 +12,15 @@ import {
   type RubbingState,
 } from '@/types/rubbing';
 import type { Seal, SealDraft, SealType } from '@/types/seal';
+import { toPendingSave, type PendingSave } from '@/utils/saveRetry';
 import type { RootState } from './store';
+
+/** 编目侧（拓本 / 钤印）失败动作种类；保存失败只在编目侧重试，巡查单不动 */
+export type RubbingRetryKind =
+  | 'rubbing/create'
+  | 'rubbing/update'
+  | 'seal/create'
+  | 'seal/update';
 
 export interface RubbingFilters {
   keyword: string;
@@ -29,6 +37,8 @@ export interface RubbingState2 {
   error: string;
   currentRubbingId: string | null;
   filters: RubbingFilters;
+  /** 编目侧保存失败重试队列（与巡查侧互不影响） */
+  pendingSaves: PendingSave<RubbingRetryKind, Record<string, unknown>>[];
 }
 
 const initialState: RubbingState2 = {
@@ -39,6 +49,7 @@ const initialState: RubbingState2 = {
   error: '',
   currentRubbingId: null,
   filters: { keyword: '', methods: [], states: [], steleId: null },
+  pendingSaves: [],
 };
 
 export const loadRubbings = createAsyncThunk('rubbing/load', async () => {
@@ -133,6 +144,23 @@ export const removeSeal = createAsyncThunk('seal/remove', async (id: string, { d
   await dispatch(loadRubbings());
 });
 
+/** 编目侧重试：拓本 / 钤印保存失败只在本侧重放，巡查侧数据不动 */
+export const retryRubbingSave = createAsyncThunk(
+  'rubbing/retry',
+  async (fp: string, { dispatch, getState }) => {
+    const state = getState() as RootState;
+    const pending = state.rubbing.pendingSaves.find((item) => item.fp === fp);
+    if (!pending) return;
+    if (pending.kind === 'rubbing/create') await dispatch(createRubbing(pending.payload as RubbingDraft)).unwrap();
+    else if (pending.kind === 'rubbing/update')
+      await dispatch(updateRubbing(pending.payload as { id: string; patch: Partial<Rubbing> })).unwrap();
+    else if (pending.kind === 'seal/create') await dispatch(createSeal(pending.payload as SealDraft)).unwrap();
+    else if (pending.kind === 'seal/update')
+      await dispatch(updateSeal(pending.payload as { id: string; patch: Partial<Seal> })).unwrap();
+    dispatch(dismissRubbingPending(fp));
+  },
+);
+
 const rubbingSlice = createSlice({
   name: 'rubbing',
   initialState,
@@ -155,6 +183,17 @@ const rubbingSlice = createSlice({
     resetRubbingFilters(state) {
       state.filters = { keyword: '', methods: [], states: [], steleId: null };
     },
+    /** 移除一条编目侧失败记录（放弃重试） */
+    dismissRubbingPending(state, action: PayloadAction<string>) {
+      state.pendingSaves = state.pendingSaves.filter((item) => item.fp !== action.payload);
+    },
+    /** 编目侧（拓本 / 钤印）保存失败入本侧队列 */
+    enqueueRubbingPending(
+      state,
+      action: PayloadAction<{ kind: RubbingRetryKind; payload: Record<string, unknown>; error: unknown }>,
+    ) {
+      state.pendingSaves.push(toPendingSave(action.payload.kind, action.payload.payload, action.payload.error));
+    },
   },
   extraReducers: (builder) => {
     builder
@@ -175,6 +214,10 @@ const rubbingSlice = createSlice({
         state.loading = false;
         state.ready = true;
         state.error = action.error.message ?? '拓本读取失败';
+      })
+      .addCase(retryRubbingSave.rejected, (state, action) => {
+        const target = state.pendingSaves.find((item) => item.fp === action.meta.arg);
+        if (target) target.error = action.error.message ?? '编目侧重试仍失败';
       });
   },
 });
@@ -186,6 +229,8 @@ export const {
   setRubbingStates,
   setRubbingSteleFilter,
   resetRubbingFilters,
+  dismissRubbingPending,
+  enqueueRubbingPending,
 } = rubbingSlice.actions;
 
 export const selectRubbingState = (state: RootState): RubbingState2 => state.rubbing;

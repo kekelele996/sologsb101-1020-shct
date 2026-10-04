@@ -333,3 +333,8 @@ body::before {
 .gb-diff-card.is-b {
   border-left: 4px solid #a8623a;
 }
+
+/* 字位对账：挂起行整行淡红底，提醒断代未放行 */
+.gb-reconcile-row.is-pending > td {
+  background: rgba(176, 58, 46, 0.06) !important;
+}
