@@ -5,6 +5,7 @@
  */
 import { useEffect, useMemo, useState } from 'react';
 import {
+  Alert,
   App as AntdApp,
   Button,
   Card,
@@ -74,6 +75,7 @@ import {
 } from '@/types/seal';
 import { selectLosses } from '@/stores/lossSlice';
 import LossTag from '@/components/common/LossTag';
+import { useSaveRetry } from '@/hooks/useSaveRetry';
 
 const FILTER_KEYS = ['method', 'state'] as const;
 
@@ -101,6 +103,9 @@ export default function RubbingList() {
   const [editingSeal, setEditingSeal] = useState<Seal | null>(null);
   const [selectedSealIds, setSelectedSealIds] = useState<string[]>([]);
   const [batchSealType, setBatchSealType] = useState<SealType>('collection');
+
+  // 编目室保存失败只重试拓本侧，巡查单不动
+  const rubbingSave = useSaveRetry();
 
   useEffect(() => {
     dispatch(setRubbingKeyword(url.keyword));
@@ -165,14 +170,19 @@ export default function RubbingList() {
 
   const submit = async (): Promise<void> => {
     const values = await form.validateFields();
-    if (editing) {
-      await dispatch(updateRubbing({ id: editing.id, patch: values })).unwrap();
-      message.success(`已更新第 ${values.versionNo} 版拓本`);
-    } else {
-      await dispatch(createRubbing(values)).unwrap();
-      message.success(`已登记第 ${values.versionNo} 版拓本`);
+    const action = async (): Promise<void> => {
+      if (editing) {
+        await dispatch(updateRubbing({ id: editing.id, patch: values })).unwrap();
+      } else {
+        await dispatch(createRubbing(values)).unwrap();
+      }
+    };
+    const ok = await rubbingSave.run(action);
+    if (ok) {
+      message.success(editing ? `已更新第 ${values.versionNo} 版拓本` : `已登记第 ${values.versionNo} 版拓本`);
+      setOpen(false);
+      rubbingSave.reset();
     }
-    setOpen(false);
   };
 
   const openSeals = (rubbing: Rubbing): void => {
@@ -306,6 +316,21 @@ export default function RubbingList() {
         <StatBadge label="钤印总数" value={stat.seals} suffix="方" tone="info" />
         <StatBadge label="损泐字位" value={stat.losses} suffix="条" tone="danger" />
       </div>
+
+      {rubbingSave.state.status === 'error' ? (
+        <Alert
+          style={{ marginBottom: 14 }}
+          type="error"
+          showIcon
+          message={`拓本保存失败：${rubbingSave.state.error}`}
+          description="编目室保存失败只重试拓本侧，巡查单不动。"
+          action={
+            <Button size="small" danger onClick={() => void rubbingSave.retry()}>
+              重试拓本保存
+            </Button>
+          }
+        />
+      ) : null}
 
       <FilterBar
         keyword={url.keyword}

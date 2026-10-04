@@ -7,11 +7,13 @@ import type { Rubbing } from '@/types/rubbing';
 import type { Loss } from '@/types/loss';
 import type { Seal } from '@/types/seal';
 import type { Compare } from '@/types/compare';
+import type { Inspection } from '@/types/inspection';
 import { STELE_FORM_LABEL } from '@/types/stele';
 import { INK_TONE_LABEL, RUBBING_METHOD_LABEL, RUBBING_STATE_LABEL } from '@/types/rubbing';
 import { LOSS_SEVERITY_LABEL, LOSS_TYPE_LABEL } from '@/types/loss';
 import { SEAL_TYPE_LABEL, sealPositionWeight } from '@/types/seal';
 import { COMPARE_CONCLUSION_LABEL } from '@/types/compare';
+import { SUSPENSION_STATUS_LABEL } from '@/types/inspection';
 import { diffLosses, encodeCoord, sortLosses } from './collate';
 import type { RubbingSnapshot } from './db';
 
@@ -44,13 +46,14 @@ function csvCell(value: string | number | null): string {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
-/** 编目卡：一块碑刻 + 其拓本 + 损泐 + 钤印 + 比对结论 */
+/** 编目卡：一块碑刻 + 其拓本 + 损泐 + 钤印 + 比对结论 + 原石巡查 */
 export function buildCatalogCard(
   stele: Stele,
   rubbings: Rubbing[],
   losses: Loss[],
   seals: Seal[],
   compares: Compare[],
+  inspections: Inspection[] = [],
 ): string {
   const lines: string[] = [];
   lines.push(`【碑帖编目卡】${stele.title}`);
@@ -96,6 +99,34 @@ export function buildCatalogCard(
       }　操作人 ${compare.operator || '未填'}`,
     );
   });
+
+  const steleInspections = inspections.filter((insp) => insp.steleId === stele.id);
+  lines.push('');
+  lines.push(`原石巡查记录（${steleInspections.length} 张）：`);
+  if (steleInspections.length === 0) lines.push('　无');
+  steleInspections.forEach((insp) => {
+    lines.push(
+      `　${insp.inspectDate}　巡查人 ${insp.inspector || '未填'}　碑面现状：${insp.surfaceState || '未记'}　防护处置：${insp.protection || '未记'}`,
+    );
+    if (insp.splitStatus === 'readonly') {
+      lines.push(`　　只读老单（残损描述未拆字位）：${insp.legacyDamageNote}`);
+    } else {
+      insp.damagePositions.forEach((d) => {
+        lines.push(
+          `　　${encodeCoord(d.lineNo, d.charNo)}　${LOSS_TYPE_LABEL[d.type]}·${LOSS_SEVERITY_LABEL[d.severity]}　${d.note || ''}`,
+        );
+      });
+    }
+    if (insp.suspensions.length > 0) {
+      lines.push(`　　挂起字位（${insp.suspensions.length} 个）：`);
+      insp.suspensions.forEach((s) => {
+        const rubbing = rubbings.find((r) => r.id === s.rubbingId);
+        lines.push(
+          `　　　${encodeCoord(s.lineNo, s.charNo)}　第 ${rubbing?.versionNo ?? '?'} 版　${SUSPENSION_STATUS_LABEL[s.status]}　${s.verifyNote || ''}`,
+        );
+      });
+    }
+  });
   return lines.join('\n');
 }
 
@@ -106,9 +137,10 @@ export function exportCatalogCard(
   losses: Loss[],
   seals: Seal[],
   compares: Compare[],
+  inspections: Inspection[] = [],
 ): string {
   const filename = `${stele.title}-编目卡-${stampSuffix()}.txt`;
-  download(filename, buildCatalogCard(stele, rubbings, losses, seals, compares), 'text/plain;charset=utf-8');
+  download(filename, buildCatalogCard(stele, rubbings, losses, seals, compares, inspections), 'text/plain;charset=utf-8');
   return filename;
 }
 
@@ -118,6 +150,7 @@ export interface ExportContext {
   losses: Loss[];
   seals: Seal[];
   compares: Compare[];
+  inspections: Inspection[];
 }
 
 /** 全部碑刻的编目卡合订文本 */
@@ -131,6 +164,7 @@ export function buildAllCatalogCards(context: ExportContext): string {
         context.losses,
         context.seals,
         context.compares,
+        context.inspections,
       ),
     )
     .join('\n\n————————————————\n\n');

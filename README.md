@@ -70,7 +70,8 @@ npm run preview    # 本地预览构建产物（http://localhost:22820）
 | `/steles` | 碑刻与所在地台账 | 新建碑刻、按年代与形制筛选（同步 URL query），卡片回显已收拓本数、损泐字位与最近断代结论 | Stele、Rubbing、Loss、Compare |
 | `/rubbings` | 拓本登记 | 录入拓法、纸墨、尺寸与收藏号；同碑自动生成版本序号，钤印增删改与批量调整印别，批量改状态 | Rubbing、Seal、Stele |
 | `/losses` | 损泐字位标注台 | 行号 × 字位网格逐格标注，批量改严重程度；选定基准拓本即时高亮差异字位 | Loss、Rubbing |
-| `/compare` | 同碑多版本比对与断代 | 选定 A/B 两拓本，按字位坐标比对损泐集合并排展示差异，推断早本 / 晚本 / 同版 / 待考并落库 | Compare、Loss、Rubbing |
+| `/inspections` | 原石巡查与对账 | 保管组登记巡查单（碑面现状、防护处置、按字位记录的残损），同一碑刻按字位把拓本损泐和巡查单残损对账；拓本标了损泐而巡查单没记的字位先挂起，等保管组到现场看过再定；挂起未核实前该拓本断代比对不放行 | Inspection、Loss、Rubbing、Stele |
+| `/compare` | 同碑多版本比对与断代 | 选定 A/B 两拓本，按字位坐标比对损泐集合并排展示差异，推断早本 / 晚本 / 同版 / 待考并落库；有挂起字位未核实则暂不放行 | Compare、Loss、Rubbing、Inspection |
 | `/export` | 编目卡生成与导出 | 按碑刻生成编目卡文本、合订导出、钤印明细、JSON 导入导出、损泐台账 CSV、清空重播种 | 全部模型 |
 
 `/` 与未匹配路径重定向到 `/steles`。筛选条件写入 URL query（`?kw=&method=&state=` 等），可直接分享带条件的链接。
@@ -86,8 +87,9 @@ npm run preview    # 本地预览构建产物（http://localhost:22820）
 | Loss 损泐字位 | `src/types/loss.ts` | `id` `rubbingId` `lineNo` `charNo` `type`（缺字/裂痕/漫漶/石花） `severity`（轻/中/重） `note` | 按行列网格标注，同碑同字位自动并排对比 |
 | Seal 钤印 | `src/types/seal.ts` | `id` `rubbingId` `sealText` `position` `transcription` `sealType`（收藏印/鉴赏印/作者印） | 按位置排序展示，支持批量改印别 |
 | Compare 版本比对 | `src/types/compare.ts` | `id` `steleId` `rubbingIdA` `rubbingIdB` `diffCount` `conclusion`（早本/晚本/同版/待考） `operator` `date` | 选定两拓本即生成差异清单并回写断代结论 |
+| Inspection 原石巡查单 | `src/types/inspection.ts` | `id` `steleId` `inspectDate` `inspector` `surfaceState` `protection` `damagePositions[]`（行号/字位/类型/程度） `suspensions[]`（挂起字位/待核实/已确认/已撤销） `legacyDamageNote` `splitStatus`（已拆/只读） | 保管组照原石现状记残损，按字位与拓本损泐对账；挂起字位等现场核实，未核实前断代比对不放行 |
 
-数据结构版本号 `DB_SCHEMA_VERSION` 定义在 `src/utils/db.ts`，当前为 `v2`：`losses` 表增加 `charNo` 与 `[rubbingId+lineNo+charNo]` 复合索引，并在 Dexie `.upgrade()` 中按行号顺序为历史字位记录重建 `charNo`。
+数据结构版本号 `DB_SCHEMA_VERSION` 定义在 `src/utils/db.ts`，当前为 `v3`：新增 `inspections` 表（原石巡查单），旧单残损描述在 Dexie `.upgrade()` 与导入时按碑面行号补拆为字位坐标，拆不出来的老单留只读。`v1→v2` 为 `losses` 表增加 `charNo` 与 `[rubbingId+lineNo+charNo]` 复合索引，并按行号顺序为历史字位记录重建 `charNo`。
 
 ---
 
@@ -97,11 +99,11 @@ npm run preview    # 本地预览构建产物（http://localhost:22820）
 sologsb101-1020/
 ├── frontend/                     # 前端源码
 │   ├── src/
-│   │   ├── types/                # stele.ts rubbing.ts loss.ts seal.ts compare.ts
-│   │   ├── stores/               # steleSlice.ts rubbingSlice.ts lossSlice.ts store.ts
+│   │   ├── types/                # stele.ts rubbing.ts loss.ts seal.ts compare.ts inspection.ts
+│   │   ├── stores/               # steleSlice.ts rubbingSlice.ts lossSlice.ts inspectionSlice.ts store.ts
 │   │   ├── components/common/    # LossTag.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx
-│   │   ├── hooks/                # useLossDiff.ts useIdbTable.ts
-│   │   ├── pages/                # SteleList.tsx RubbingList.tsx LossBoard.tsx CompareView.tsx ExportView.tsx
+│   │   ├── hooks/                # useLossDiff.ts useIdbTable.ts useSaveRetry.ts
+│   │   ├── pages/                # SteleList.tsx RubbingList.tsx LossBoard.tsx InspectionBoard.tsx CompareView.tsx ExportView.tsx
 │   │   ├── router/               # index.tsx
 │   │   ├── utils/                # collate.ts db.ts export.ts
 │   │   ├── styles/               # main.css
@@ -123,9 +125,9 @@ sologsb101-1020/
 
 ## 七、数据存储说明
 
-- **IndexedDB（Dexie，数据库名 `gbrubbing`）**：5 张业务表 `steles` / `rubbings` / `losses` / `seals` / `compares`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；`initDatabase()` 首次打开时自动播种**三层互相引用**的演示数据（Stele → Rubbing → Loss / Seal，另有 Stele → Compare，固定 id 如 `stele_01`、`rub_0101`、`loss_010101`），播种幂等，保证字位网格与比对台打开即有内容。
+- **IndexedDB（Dexie，数据库名 `gbrubbing`）**：6 张业务表 `steles` / `rubbings` / `losses` / `seals` / `compares` / `inspections`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；`initDatabase()` 首次打开时自动播种**三层互相引用**的演示数据（Stele → Rubbing → Loss / Seal，Stele → Compare，Stele → Inspection，固定 id 如 `stele_01`、`rub_0101`、`loss_010101`、`insp_0101`），播种幂等，保证字位网格、比对台与原石巡查打开即有内容。
 - **localStorage**：仅存元数据 —— `gbrubbing:db-version`（本地结构版本）、`gbrubbing:last-backup-at`（最近导出时间）、`gbrubbing:ui-prefs`（当前碑刻 / 拓本）。
-- **备份**：`/export` 页可导出 JSON（5 张表全量数据 + 结构版本号），导入时校验 `app` 字段与各集合数组完整性，覆盖导入前二次确认；另有编目卡 TXT 与损泐台账 CSV。
+- **备份**：`/export` 页可导出 JSON（6 张表全量数据 + 结构版本号），导入时校验 `app` 字段与各集合数组完整性，覆盖导入前二次确认；旧单残损描述在导入时按碑面行号补拆，拆不出来留只读；另有编目卡 TXT 与损泐台账 CSV。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
 
 ---

@@ -12,6 +12,7 @@ import {
   ExportOutlined,
   FileSearchOutlined,
   PrinterOutlined,
+  SafetyCertificateOutlined,
 } from '@ant-design/icons';
 import { ROUTES } from './router';
 import { loadAll, useAppDispatch, useAppSelector } from './stores/store';
@@ -56,11 +57,13 @@ export default function App() {
     ? ROUTES.rubbings
     : location.pathname.startsWith('/losses')
       ? ROUTES.losses
-      : location.pathname.startsWith('/compare')
-        ? ROUTES.compare
-        : location.pathname.startsWith('/export')
-          ? ROUTES.export
-          : ROUTES.steles;
+      : location.pathname.startsWith('/inspections')
+        ? ROUTES.inspections
+        : location.pathname.startsWith('/compare')
+          ? ROUTES.compare
+          : location.pathname.startsWith('/export')
+            ? ROUTES.export
+            : ROUTES.steles;
 
   return (
     <Layout style={{ minHeight: '100vh', background: 'transparent' }}>
@@ -83,6 +86,7 @@ export default function App() {
             { key: ROUTES.steles, icon: <AppstoreOutlined />, label: '碑刻台账' },
             { key: ROUTES.rubbings, icon: <PrinterOutlined />, label: '拓本登记' },
             { key: ROUTES.losses, icon: <BookOutlined />, label: '损泐字位' },
+            { key: ROUTES.inspections, icon: <SafetyCertificateOutlined />, label: '原石巡查' },
             { key: ROUTES.compare, icon: <DiffOutlined />, label: '版本比对' },
             { key: ROUTES.export, icon: <ExportOutlined />, label: '编目卡导出' },
           ]}

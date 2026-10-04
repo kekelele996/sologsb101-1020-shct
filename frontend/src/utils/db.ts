@@ -1,8 +1,10 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据结构版本号与升级迁移逻辑（v1 → v2：Loss 增加 charNo 与复合索引，并按行号顺序重建历史字位记录）
- * - 五张业务表的增删改查与整库导入导出
- * - 首次打开自动播种三层互相引用的演示数据（幂等）
+ * - 数据结构版本号与升级迁移逻辑
+ *   v1 → v2：Loss 增加 charNo 与复合索引，按行号顺序重建历史字位记录
+ *   v2 → v3：新增 inspections 表（原石巡查单），旧单残损描述按碑面行号补拆，拆不出来留只读
+ * - 六张业务表的增删改查与整库导入导出
+ * - 首次打开自动播种演示数据（幂等）
  * 纯前端应用：不依赖任何后端服务或数据库。
  */
 import Dexie, { type Table } from 'dexie';
@@ -11,13 +13,14 @@ import type { Rubbing } from '@/types/rubbing';
 import type { Loss } from '@/types/loss';
 import type { Seal } from '@/types/seal';
 import type { Compare } from '@/types/compare';
-import { sortLosses } from './collate';
+import type { Inspection } from '@/types/inspection';
+import { sortLosses, splitLegacyDamageNote } from './collate';
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbrubbing';
 
 /** 当前数据结构版本号 */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -85,6 +88,7 @@ class RubbingDatabase extends Dexie {
   losses!: Table<Loss, string>;
   seals!: Table<Seal, string>;
   compares!: Table<Compare, string>;
+  inspections!: Table<Inspection, string>;
 
   constructor() {
     super(DB_NAME);
@@ -99,7 +103,7 @@ class RubbingDatabase extends Dexie {
     });
 
     // v2：Loss 增加 charNo 与 [rubbingId+lineNo+charNo] 复合索引，并按行号顺序重建历史字位记录
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         steles: 'id, title, era, form, location, updatedAt',
         rubbings: 'id, steleId, versionNo, method, inkTone, state, updatedAt',
@@ -127,6 +131,41 @@ class RubbingDatabase extends Dexie {
           });
         });
         await table.bulkPut(sortLosses(rebuilt));
+      });
+
+    // v3：新增 inspections 表（原石巡查单）；旧单残损描述按碑面行号补拆，拆不出来留只读
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        steles: 'id, title, era, form, location, updatedAt',
+        rubbings: 'id, steleId, versionNo, method, inkTone, state, updatedAt',
+        losses: 'id, rubbingId, lineNo, charNo, [rubbingId+lineNo+charNo], type, severity, updatedAt',
+        seals: 'id, rubbingId, sealType, position, updatedAt',
+        compares: 'id, steleId, rubbingIdA, rubbingIdB, conclusion, date, updatedAt',
+        inspections: 'id, steleId, inspectDate, splitStatus, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // v2 无巡查单表，此处仅对可能存在的旧数据做结构兜底；
+        // 旧单残损描述的补拆逻辑在 importSnapshot 导入时统一执行（splitLegacyDamageNote）。
+        const table = tx.table<Inspection>('inspections');
+        const all = await table.toArray();
+        const rebuilt: Inspection[] = all.map((row) => {
+          if (row.splitStatus === 'readonly' || row.damagePositions.length > 0) return row;
+          const positions = splitLegacyDamageNote(row.legacyDamageNote);
+          if (!positions) return { ...row, splitStatus: 'readonly' as const };
+          return {
+            ...row,
+            splitStatus: 'split' as const,
+            damagePositions: positions.map((p) => ({
+              lineNo: p.lineNo,
+              charNo: p.charNo,
+              type: 'blur' as const,
+              severity: 'medium' as const,
+              note: '旧单按行号补拆',
+            })),
+            updatedAt: Date.now(),
+          };
+        });
+        if (rebuilt.length > 0) await table.bulkPut(rebuilt);
       });
   }
 }
@@ -224,12 +263,75 @@ export async function seedDatabase(): Promise<void> {
     { id: 'cmp_0201', steleId: 'stele_02', rubbingIdA: 'rub_0201', rubbingIdB: 'rub_0202', diffCount: 1, conclusion: 'late', operator: '傅砚', date: '2026-03-08', createdAt: now - day * 3, updatedAt: now - day * 3 },
   ];
 
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
+  const inspections: Inspection[] = [
+    {
+      id: 'insp_0101',
+      steleId: 'stele_01',
+      inspectDate: '2026-03-01',
+      inspector: '保管组·老周',
+      surfaceState: '碑面基本完好，第3行「壽」字右下有漫漶，第9行「禮」字缺末笔。',
+      protection: '已加装防护罩，每周巡查一次，雨天注意排水。',
+      damagePositions: [
+        { lineNo: 3, charNo: 7, type: 'blur', severity: 'light', note: '现场核对，「壽」字右下漫漶' },
+        { lineNo: 9, charNo: 11, type: 'missing', severity: 'heavy', note: '「禮」字缺末笔' },
+      ],
+      suspensions: [
+        {
+          id: 'susp_010101',
+          rubbingId: 'rub_0102',
+          lineNo: 12,
+          charNo: 4,
+          status: 'pending',
+          verifiedAt: null,
+          verifyNote: '',
+          verifyType: null,
+          verifySeverity: null,
+        },
+      ],
+      legacyDamageNote: '',
+      splitStatus: 'split',
+      createdAt: now - day * 8,
+      updatedAt: now - day * 2,
+    },
+    {
+      id: 'insp_0201',
+      steleId: 'stele_02',
+      inspectDate: '2026-02-15',
+      inspector: '保管组·老周',
+      surfaceState: '崖面有细裂，第2行第5字位裂痕。',
+      protection: '裂隙处已做标记，季度观测。',
+      damagePositions: [
+        { lineNo: 2, charNo: 5, type: 'crack', severity: 'light', note: '崖面细裂' },
+      ],
+      suspensions: [],
+      legacyDamageNote: '',
+      splitStatus: 'split',
+      createdAt: now - day * 20,
+      updatedAt: now - day * 20,
+    },
+    {
+      id: 'insp_0301',
+      steleId: 'stele_03',
+      inspectDate: '2026-01-10',
+      inspector: '保管组·老王',
+      surfaceState: '碑面风化较重，字口多有漫漶。',
+      protection: '已移入室内碑廊，控制温湿度。',
+      damagePositions: [],
+      suspensions: [],
+      legacyDamageNote: '第4行 字口已平；第7行 漫漶不清；第11行 有石花',
+      splitStatus: 'readonly',
+      createdAt: now - day * 50,
+      updatedAt: now - day * 50,
+    },
+  ];
+
+  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares, db.inspections], async () => {
     await db.steles.bulkPut(steles);
     await db.rubbings.bulkPut(rubbings);
     await db.losses.bulkPut(losses);
     await db.seals.bulkPut(seals);
     await db.compares.bulkPut(compares);
+    await db.inspections.bulkPut(inspections);
   });
 }
 
@@ -244,15 +346,17 @@ export interface RubbingSnapshot {
   losses: Loss[];
   seals: Seal[];
   compares: Compare[];
+  inspections: Inspection[];
 }
 
 export async function exportSnapshot(): Promise<RubbingSnapshot> {
-  const [steles, rubbings, losses, seals, compares] = await Promise.all([
+  const [steles, rubbings, losses, seals, compares, inspections] = await Promise.all([
     db.steles.toArray(),
     db.rubbings.toArray(),
     db.losses.toArray(),
     db.seals.toArray(),
     db.compares.toArray(),
+    db.inspections.toArray(),
   ]);
   return {
     app: DB_NAME,
@@ -263,6 +367,7 @@ export async function exportSnapshot(): Promise<RubbingSnapshot> {
     losses,
     seals,
     compares,
+    inspections,
   };
 }
 
@@ -271,7 +376,7 @@ export function validateSnapshot(input: unknown): string {
   if (typeof input !== 'object' || input === null) return '文件内容不是合法的 JSON 对象';
   const snapshot = input as Partial<RubbingSnapshot>;
   if (snapshot.app !== DB_NAME) return `备份文件不属于本项目（app=${String(snapshot.app)}）`;
-  const keys: Array<keyof RubbingSnapshot> = ['steles', 'rubbings', 'losses', 'seals', 'compares'];
+  const keys: Array<keyof RubbingSnapshot> = ['steles', 'rubbings', 'losses', 'seals', 'compares', 'inspections'];
   for (const key of keys) {
     if (!Array.isArray(snapshot[key])) return `备份文件缺少 ${String(key)} 集合`;
   }
@@ -279,25 +384,44 @@ export function validateSnapshot(input: unknown): string {
 }
 
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
+  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares, db.inspections], async () => {
     await Promise.all([
       db.steles.clear(),
       db.rubbings.clear(),
       db.losses.clear(),
       db.seals.clear(),
       db.compares.clear(),
+      db.inspections.clear(),
     ]);
   });
 }
 
 export async function importSnapshot(snapshot: RubbingSnapshot): Promise<void> {
+  // 旧单残损描述按碑面行号补拆，拆不出来的老单留只读
+  const inspections = snapshot.inspections.map((row) => {
+    if (row.splitStatus === 'readonly' || row.damagePositions.length > 0) return row;
+    const positions = splitLegacyDamageNote(row.legacyDamageNote);
+    if (!positions) return { ...row, splitStatus: 'readonly' as const };
+    return {
+      ...row,
+      splitStatus: 'split' as const,
+      damagePositions: positions.map((p) => ({
+        lineNo: p.lineNo,
+        charNo: p.charNo,
+        type: 'blur' as const,
+        severity: 'medium' as const,
+        note: '旧单按行号补拆',
+      })),
+    };
+  });
   await clearAllTables();
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
+  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares, db.inspections], async () => {
     await db.steles.bulkPut(snapshot.steles);
     await db.rubbings.bulkPut(snapshot.rubbings);
     await db.losses.bulkPut(snapshot.losses);
     await db.seals.bulkPut(snapshot.seals);
     await db.compares.bulkPut(snapshot.compares);
+    await db.inspections.bulkPut(inspections);
   });
 }
 
@@ -307,26 +431,28 @@ export async function resetDatabase(): Promise<void> {
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [steles, rubbings, losses, seals, compares] = await Promise.all([
+  const [steles, rubbings, losses, seals, compares, inspections] = await Promise.all([
     db.steles.count(),
     db.rubbings.count(),
     db.losses.count(),
     db.seals.count(),
     db.compares.count(),
+    db.inspections.count(),
   ]);
-  return { steles, rubbings, losses, seals, compares };
+  return { steles, rubbings, losses, seals, compares, inspections };
 }
 
-/** 级联删除碑刻 → 拓本 → 损泐 / 钤印 / 比对 */
+/** 级联删除碑刻 → 拓本 → 损泐 / 钤印 / 比对 / 巡查单 */
 export async function removeSteleCascade(steleId: string): Promise<void> {
   const rubbingIds = (await db.rubbings.where('steleId').equals(steleId).toArray()).map((row) => row.id);
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
+  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares, db.inspections], async () => {
     if (rubbingIds.length > 0) {
       await db.losses.where('rubbingId').anyOf(rubbingIds).delete();
       await db.seals.where('rubbingId').anyOf(rubbingIds).delete();
     }
     await db.rubbings.where('steleId').equals(steleId).delete();
     await db.compares.where('steleId').equals(steleId).delete();
+    await db.inspections.where('steleId').equals(steleId).delete();
     await db.steles.delete(steleId);
   });
 }

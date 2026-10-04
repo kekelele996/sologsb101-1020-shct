@@ -4,6 +4,7 @@
  * 消费 Compare、Loss、Rubbing；复用 <LossTag>、<StatBadge>、<EmptyPanel>、<FilterBar>。
  */
 import { useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   Alert,
   App as AntdApp,
@@ -28,6 +29,7 @@ import FilterBar, { useFilterQuery, type FilterSelectConfig } from '@/components
 import LossTag from '@/components/common/LossTag';
 import StatBadge from '@/components/common/StatBadge';
 import { useLossDiff } from '@/hooks/useLossDiff';
+import { ROUTES } from '@/router';
 import { useAppDispatch, useAppSelector } from '@/stores/store';
 import { selectSteles, setCurrentStele } from '@/stores/steleSlice';
 import { selectRubbings } from '@/stores/rubbingSlice';
@@ -51,6 +53,7 @@ import {
   type CompareConclusion,
   type CompareDraft,
 } from '@/types/compare';
+import { selectPendingSuspensionsByRubbing } from '@/stores/inspectionSlice';
 import { buildDiffText, copyText } from '@/utils/export';
 import { encodeCoord } from '@/utils/collate';
 
@@ -59,6 +62,7 @@ const FILTER_KEYS = ['type'] as const;
 export default function CompareView() {
   const { message } = AntdApp.useApp();
   const dispatch = useAppDispatch();
+  const navigate = useNavigate();
   const [form] = Form.useForm<CompareDraft>();
 
   const steles = useAppSelector(selectSteles);
@@ -104,6 +108,15 @@ export default function CompareView() {
   const diff = useLossDiff(compareAId ?? undefined, compareBId ?? undefined);
   const stele = steles.find((item) => item.id === steleId);
 
+  // 断代比对放行：拓本有挂起未核实字位时暂不放行
+  const pendingSuspensionsA = useAppSelector((state) =>
+    compareAId ? selectPendingSuspensionsByRubbing(state, compareAId) : 0,
+  );
+  const pendingSuspensionsB = useAppSelector((state) =>
+    compareBId ? selectPendingSuspensionsByRubbing(state, compareBId) : 0,
+  );
+  const blockedBySuspension = pendingSuspensionsA + pendingSuspensionsB > 0;
+
   const selects: FilterSelectConfig[] = [
     {
       key: 'type',
@@ -145,6 +158,10 @@ export default function CompareView() {
     }
     if (compareAId === compareBId) {
       message.warning('请选择两个不同的拓本进行比对');
+      return;
+    }
+    if (blockedBySuspension) {
+      message.warning('该拓本有挂起字位未核实，断代比对暂不放行');
       return;
     }
     setEditing(null);
@@ -255,7 +272,7 @@ export default function CompareView() {
               dispatch(setCurrentStele(value));
             }}
           />
-          <Button type="primary" icon={<SaveOutlined />} onClick={openCreate}>
+          <Button type="primary" icon={<SaveOutlined />} onClick={openCreate} disabled={blockedBySuspension}>
             保存比对记录
           </Button>
         </Space>
@@ -269,6 +286,21 @@ export default function CompareView() {
         <StatBadge label="一致字位" value={diff.result.sameCount} suffix="字" tone="success" />
         <StatBadge label="推断结论" value={COMPARE_CONCLUSION_LABEL[diff.suggestedConclusion]} tone="success" />
       </div>
+
+      {blockedBySuspension ? (
+        <Alert
+          style={{ marginBottom: 14 }}
+          type="warning"
+          showIcon
+          message={`断代比对暂不放行：A 拓本有 ${pendingSuspensionsA} 个、B 拓本有 ${pendingSuspensionsB} 个挂起字位未核实`}
+          description="拓本标了损泐而巡查单没记的字位已挂起，等保管组到现场核实并结案后，断代比对才会放行。可在「原石巡查」页处理挂起。"
+          action={
+            <Button size="small" onClick={() => navigate(ROUTES.inspections)}>
+              前往原石巡查
+            </Button>
+          }
+        />
+      ) : null}
 
       <Card size="small" style={{ marginBottom: 14 }}>
         <Space wrap size={12} align="center">

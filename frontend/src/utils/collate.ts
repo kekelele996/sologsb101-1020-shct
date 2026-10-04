@@ -12,6 +12,7 @@ import {
   type LossType,
 } from '@/types/loss';
 import type { CompareConclusion } from '@/types/compare';
+import type { Inspection, InspectionDamage, Suspension } from '@/types/inspection';
 
 /** 字位坐标 → 可读编码 L03C07 */
 export function encodeCoord(lineNo: number, charNo: number): string {
@@ -185,4 +186,122 @@ export function maxCharNo(losses: Loss[]): number {
 /** 拓本版本序号展示文案 */
 export function versionLabel(versionNo: number): string {
   return `第 ${versionNo} 版`
+}
+
+/* ------------------------------ 原石巡查对账 ------------------------------ */
+
+export interface ReconcileRow {
+  key: string;
+  lineNo: number;
+  charNo: number;
+  /** 拓本损泐（可能多条，取最重） */
+  rubbingLoss: Loss | null;
+  /** 巡查单残损 */
+  inspectionDamage: InspectionDamage | null;
+  /** 挂起记录（已 persisted 的） */
+  suspension: Suspension | null;
+  /** 对账结果：一致 / 挂起 / 巡查另记 */
+  kind: 'matched' | 'suspended' | 'inspectionOnly';
+}
+
+export interface ReconcileResult {
+  rows: ReconcileRow[];
+  matchedCount: number;
+  suspendedCount: number;
+  inspectionOnlyCount: number;
+  /** 待核实挂起数（影响断代比对放行） */
+  pendingSuspendedCount: number;
+}
+
+/** 取同一字位上最严重的巡查残损记录 */
+function heaviestDamage(list: InspectionDamage[]): InspectionDamage | null {
+  if (list.length === 0) return null;
+  return [...list].sort((a, b) => severityWeight(b.severity) - severityWeight(a.severity))[0] ?? null;
+}
+
+/**
+ * 同一碑刻按字位把拓本损泐和巡查单里的残损对账。
+ * - 两边都记 → 一致
+ * - 拓本记了而巡查单没记 → 挂起（等保管组现场核实）
+ * - 巡查单记了而拓本没记 → 巡查另记（原石现状，不回填拓本）
+ */
+export function reconcileLossesWithInspection(
+  rubbingLosses: Loss[],
+  inspection: Inspection | undefined,
+  rubbingId: string,
+): ReconcileResult {
+  const lossMap = new Map<string, Loss[]>();
+  rubbingLosses.forEach((loss) => {
+    const key = coordKey(loss);
+    lossMap.set(key, [...(lossMap.get(key) ?? []), loss]);
+  });
+
+  const damageMap = new Map<string, InspectionDamage[]>();
+  (inspection?.damagePositions ?? []).forEach((damage) => {
+    const key = `${damage.lineNo}:${damage.charNo}`;
+    damageMap.set(key, [...(damageMap.get(key) ?? []), damage]);
+  });
+
+  const suspensionMap = new Map<string, Suspension>();
+  (inspection?.suspensions ?? [])
+    .filter((s) => s.rubbingId === rubbingId)
+    .forEach((s) => suspensionMap.set(`${s.lineNo}:${s.charNo}`, s));
+
+  const keys = Array.from(new Set([...lossMap.keys(), ...damageMap.keys()])).sort((a, b) => {
+    const [la, ca] = a.split(':').map((item) => Number.parseInt(item, 10));
+    const [lb, cb] = b.split(':').map((item) => Number.parseInt(item, 10));
+    if (la !== lb) return (la as number) - (lb as number);
+    return (ca as number) - (cb as number);
+  });
+
+  const rows: ReconcileRow[] = keys.map((key) => {
+    const [lineNo, charNo] = key.split(':').map((item) => Number.parseInt(item, 10)) as [number, number];
+    const rubbingLoss = heaviest(lossMap.get(key) ?? []);
+    const inspectionDamage = heaviestDamage(damageMap.get(key) ?? []);
+    const suspension = suspensionMap.get(key) ?? null;
+    let kind: ReconcileRow['kind'] = 'matched';
+    if (rubbingLoss && !inspectionDamage) kind = 'suspended';
+    else if (!rubbingLoss && inspectionDamage) kind = 'inspectionOnly';
+    return { key, lineNo, charNo, rubbingLoss, inspectionDamage, suspension, kind };
+  });
+
+  const matchedCount = rows.filter((row) => row.kind === 'matched').length;
+  const suspendedCount = rows.filter((row) => row.kind === 'suspended').length;
+  const inspectionOnlyCount = rows.filter((row) => row.kind === 'inspectionOnly').length;
+  const pendingSuspendedCount = rows.filter(
+    (row) => row.kind === 'suspended' && (row.suspension === null || row.suspension.status === 'pending'),
+  ).length;
+
+  return { rows, matchedCount, suspendedCount, inspectionOnlyCount, pendingSuspendedCount };
+}
+
+/**
+ * 旧单残损描述按碑面行号补拆为字位坐标。
+ * 能按行号拆出字位的返回坐标列表（charNo 缺省补 1）；拆不出来返回 null，老单留只读。
+ */
+export function splitLegacyDamageNote(note: string): Array<{ lineNo: number; charNo: number }> | null {
+  if (!note || !note.trim()) return null;
+  const positions: Array<{ lineNo: number; charNo: number }> = [];
+  const seen = new Set<string>();
+  const push = (lineNo: number, charNo: number): void => {
+    if (!Number.isFinite(lineNo) || lineNo <= 0 || !Number.isFinite(charNo) || charNo <= 0) return;
+    const key = `${lineNo}:${charNo}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    positions.push({ lineNo, charNo });
+  };
+  // 「第N行第M字」或「LNN CMM」精确坐标
+  const exactRegex = /第\s*(\d+)\s*行\s*第\s*(\d+)\s*字|L(\d{1,3})C(\d{1,3})/gi;
+  let m: RegExpExecArray | null;
+  while ((m = exactRegex.exec(note)) !== null) {
+    push(Number(m[1] ?? m[3]), Number(m[2] ?? m[4]));
+  }
+  // 仅行号：补拆到 charNo=1（排除「第N行第M字」已被精确匹配的情况）
+  const lineRegex = /第\s*(\d+)\s*行(?!\s*第\s*\d+\s*字)|L(\d{1,3})(?!\s*C)/gi;
+  while ((m = lineRegex.exec(note)) !== null) {
+    push(Number(m[1] ?? m[2]), 1);
+  }
+  return positions.length > 0
+    ? positions.sort((a, b) => a.lineNo - b.lineNo || a.charNo - b.charNo)
+    : null;
 }
